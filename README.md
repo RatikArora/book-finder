@@ -2,6 +2,8 @@
 
 This is a minimal, deploy-ready build of Book Finder for Alex using the Open Library Search API. It runs entirely in the browser via React from a CDN—no Node.js or build step required.
 
+**GitHub Repository:** https://github.com/RatikArora/book-finder
+
 ## How to run locally
 
 - Open `cdn-dist/index.html` in your browser.
