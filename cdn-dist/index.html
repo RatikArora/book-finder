@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Book Finder — Open Library</title>
+  <link rel="stylesheet" href="./src/index.css">
+</head>
+<body>
+  <div id="root" />
+
+  <script type="module">
+    import React, { useState, useEffect, useRef, useCallback } from "https://esm.sh/react@18.3.1";
+    import { createRoot } from "https://esm.sh/react-dom@18.3.1/client";
+
+    const API_BASE = "https://openlibrary.org/search.json";
+    const COVER_BASE = (id) => `https://covers.openlibrary.org/b/id/${id}-M.jpg`;
+    const PLACEHOLDER = `data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='320' height='480'><rect width='100%' height='100%' fill='%23efefef'/><text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' fill='%23999' font-family='Arial,Helvetica,sans-serif' font-size='20'>No cover</text></svg>`;
+
+    function useDebounced(value, delay) {
+      const [debounced, setDebounced] = useState(value);
+      useEffect(() => {
+        const id = setTimeout(() => setDebounced(value), delay);
+        return () => clearTimeout(id);
+      }, [value, delay]);
+      return debounced;
+    }
+
+    function buildSearchUrl({ title, author, subject, language, page, limit, fields }) {
+      const params = new URLSearchParams();
+      if (title) params.set("title", title);
+      if (author) params.set("author", author);
+      if (subject) params.set("subject", subject);
+      if (language) params.set("language", language);
+      if (page) params.set("page", String(page));
+      if (limit) params.set("limit", String(limit));
+      if (fields) params.set("fields", fields);
+      return API_BASE + "?" + params.toString();
+    }
+
+    function formatAuthors(authors) {
+      if (!authors) return "Unknown author";
+      return authors.join(", ");
+    }
+
+    function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+    function App() {
+      const FIELDS = "key,title,author_name,first_publish_year,cover_i,edition_count,subject,language";
+      const [title, setTitle] = useState("");
+      const debouncedTitle = useDebounced(title, 500);
+      const [author, setAuthor] = useState("");
+      const [subject, setSubject] = useState("");
+      const [language, setLanguage] = useState("");
+      const [yearFrom, setYearFrom] = useState("");
+      const [yearTo, setYearTo] = useState("");
+      const [sort, setSort] = useState("relevance"); // relevance, year-asc, year-desc
+      const [page, setPage] = useState(1);
+      const [limit, setLimit] = useState(20);
+      const [results, setResults] = useState([]);
+      const [numFound, setNumFound] = useState(0);
+      const [loading, setLoading] = useState(false);
+      const [error, setError] = useState("");
+      const [selectedWork, setSelectedWork] = useState(null);
+      const [detailsLoading, setDetailsLoading] = useState(false);
+      const [detailsError, setDetailsError] = useState("");
+      const [details, setDetails] = useState(null);
+      const mountedRef = useRef(true);
+      const formRef = useRef(null);
+      const modalRef = useRef(null);
+      const lastActiveRef = useRef(null);
+
+      useEffect(()=> {
+        return () => { mountedRef.current = false; };
+      }, []);
+
+      // Lock background scroll and focus management when modal open
+      useEffect(() => {
+        if (selectedWork) {
+          lastActiveRef.current = document.activeElement;
+          document.body.classList.add("no-scroll");
+          setTimeout(() => {
+            if (modalRef.current) modalRef.current.focus();
+          }, 50);
+        } else {
+          document.body.classList.remove("no-scroll");
+          try {
+            lastActiveRef.current && lastActiveRef.current.focus();
+          } catch(e){}
+        }
+      }, [selectedWork]);
+
+      // Perform search whenever debouncedTitle, author, subject, language, page, limit change.
+      useEffect(() => {
+        // title is required
+        if (!debouncedTitle.trim()) {
+          setResults([]);
+          setNumFound(0);
+          setError("");
+          return;
+        }
+        setLoading(true);
+        setError("");
+        const url = buildSearchUrl({
+          title: debouncedTitle.trim(),
+          author: author.trim() || undefined,
+          subject: subject.trim() || undefined,
+          language: language.trim() || undefined,
+          page,
+          limit,
+          fields: FIELDS,
+        });
+
+        fetch(url)
+          .then(async (res) => {
+            if (!res.ok) throw new Error(`Search failed: ${res.status}`);
+            return res.json();
+          })
+          .then((data) => {
+            if (!mountedRef.current) return;
+            setNumFound(data.numFound || 0);
+            let docs = Array.isArray(data.docs) ? data.docs : [];
+            // filter by year if provided (client-side)
+            const from = parseInt(yearFrom) || null;
+            const to = parseInt(yearTo) || null;
+            if (from || to) {
+              docs = docs.filter(d => {
+                const y = d.first_publish_year;
+                if (!y) return false;
+                if (from && y < from) return false;
+                if (to && y > to) return false;
+                return true;
+              });
+            }
+            // client-side sorting if needed
+            if (sort === "year-asc") {
+              docs.sort((a,b) => (a.first_publish_year || 0) - (b.first_publish_year || 0));
+            } else if (sort === "year-desc") {
+              docs.sort((a,b) => (b.first_publish_year || 0) - (a.first_publish_year || 0));
+            }
+            setResults(docs);
+            setLoading(false);
+          })
+          .catch((err) => {
+            if (!mountedRef.current) return;
+            setError(err.message || "Unknown error");
+            setLoading(false);
+          });
+      }, [debouncedTitle, author, subject, language, page, limit, yearFrom, yearTo, sort]);
+
+      // When title (debounced) changes, reset page to 1
+      useEffect(()=> { setPage(1); }, [debouncedTitle, author, subject, language, yearFrom, yearTo]);
+
+      // Details fetch
+      useEffect(() => {
+        if (!selectedWork) {
+          setDetails(null);
+          setDetailsError("");
+          setDetailsLoading(false);
+          return;
+        }
+        setDetailsLoading(true);
+        setDetailsError("");
+        setDetails(null);
+        const workKey = selectedWork.key; // should be like "/works/OL..."
+        const url = `https://openlibrary.org${workKey}.json`;
+        fetch(url)
+          .then(async (res) => {
+            if (!res.ok) throw new Error(`Failed to load work: ${res.status}`);
+            return res.json();
+          })
+          .then((data) => {
+            if (!mountedRef.current) return;
+            setDetails(data);
+            setDetailsLoading(false);
+          })
+          .catch((err) => {
+            if (!mountedRef.current) return;
+            setDetailsError(err.message || "Failed to load details");
+            setDetailsLoading(false);
+          });
+      }, [selectedWork]);
+
+      const totalPages = Math.max(1, Math.ceil(numFound / limit));
+
+      const onSubmit = (e) => {
+        e && e.preventDefault();
+        setPage(1);
+        if (!title.trim()) return;
+        (async () => {
+          setLoading(true); setError("");
+          const url = buildSearchUrl({
+            title: title.trim(),
+            author: author.trim() || undefined,
+            subject: subject.trim() || undefined,
+            language: language.trim() || undefined,
+            page: 1,
+            limit,
+            fields: FIELDS,
+          });
+          try {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`Search failed: ${res.status}`);
+            const data = await res.json();
+            setNumFound(data.numFound || 0);
+            let docs = Array.isArray(data.docs) ? data.docs : [];
+            const from = parseInt(yearFrom) || null;
+            const to = parseInt(yearTo) || null;
+            if (from || to) {
+              docs = docs.filter(d => {
+                const y = d.first_publish_year;
+                if (!y) return false;
+                if (from && y < from) return false;
+                if (to && y > to) return false;
+                return true;
+              });
+            }
+            if (sort === "year-asc") {
+              docs.sort((a,b) => (a.first_publish_year || 0) - (b.first_publish_year || 0));
+            } else if (sort === "year-desc") {
+              docs.sort((a,b) => (b.first_publish_year || 0) - (a.first_publish_year || 0));
+            }
+            setResults(docs);
+            setLoading(false);
+          } catch (err) {
+            setError(err.message || "Unknown error");
+            setLoading(false);
+          }
+        })();
+      };
+
+      const prevPage = () => { if (page > 1) setPage(p => p - 1); };
+      const nextPage = () => { if (page < totalPages) setPage(p => p + 1); };
+
+      const openDetails = (work) => { setSelectedWork(work); };
+      const closeDetails = () => { setSelectedWork(null); setDetails(null); setDetailsError(""); };
+
+      const onKeyDownModal = (e) => {
+        if (e.key === "Escape") closeDetails();
+      };
+
+      // Accessible helper for disabling search when title empty
+      const canSearch = title.trim().length > 0;
+
+      return (
+        React.createElement("div", {className:"app"},
+          React.createElement("header", {className:"header"},
+            React.createElement("div", {className:"brand"},
+              React.createElement("h1", null, "📚 Book Finder"),
+              React.createElement("span", {className:"badge", title:"Powered by Open Library"}, "Open Library API")
+            )
+          ),
+          React.createElement("main", {className:"container"},
+            React.createElement("form", {ref: formRef, className:"searchRow", onSubmit: onSubmit},
+              React.createElement("fieldset", {className:"inputs", "aria-hidden": false},
+                React.createElement("label", {className:"field"},
+                  React.createElement("span", {className:"labelText"}, "Title"),
+                  React.createElement("input", {
+                    className:"input",
+                    value: title,
+                    onChange: (e)=> setTitle(e.target.value),
+                    placeholder: "e.g. harry potter",
+                    required: true,
+                    "aria-label":"Title",
+                    autoFocus: true
+                  })
+                ),
+                React.createElement("label", {className:"field"},
+                  React.createElement("span", {className:"labelText"}, "Author"),
+                  React.createElement("input", {
+                    className:"input",
+                    value: author,
+                    onChange: (e)=> setAuthor(e.target.value),
+                    placeholder: "Optional author name",
+                    "aria-label":"Author"
+                  })
+                ),
+                React.createElement("div", {className:"actionsRow"},
+                  React.createElement("button", {
+                    type:"submit",
+                    className:"btn primary",
+                    disabled: !canSearch || loading,
+                    "aria-disabled": !canSearch || loading
+                  }, loading ? "Searching…" : "Search"),
+                  React.createElement("button", {
+                    type:"button",
+                    className:"btn secondary",
+                    onClick: ()=> {
+                      setTitle("");
+                      setAuthor("");
+                      setSubject("");
+                      setLanguage("");
+                      setYearFrom("");
+                      setYearTo("");
+                      setSort("relevance");
+                      setPage(1);
+                      setResults([]);
+                      setNumFound(0);
+                      setError("");
+                    }
+                  }, "Reset")
+                )
+              ),
+              React.createElement("div", {className:"filters"},
+                React.createElement("label", null,
+                  React.createElement("span", {className:"labelText small"}, "Subject"),
+                  React.createElement("input", {
+                    className:"input",
+                    value: subject,
+                    onChange: (e)=> setSubject(e.target.value),
+                    placeholder: "e.g. fantasy"
+                  })
+                ),
+                React.createElement("label", null,
+                  React.createElement("span", {className:"labelText small"}, "Language"),
+                  React.createElement("input", {
+                    className:"input",
+                    value: language,
+                    onChange: (e)=> setLanguage(e.target.value),
+                    placeholder: "3-letter code (eng, fre, hin)"
+                  })
+                ),
+                React.createElement("div", {className:"yearRange"},
+                  React.createElement("label", null,
+                    React.createElement("span", {className:"labelText small"}, "Year from"),
+                    React.createElement("input", {
+                      className:"input",
+                      value: yearFrom,
+                      onChange: (e)=> setYearFrom(e.target.value.replace(/[^0-9]/g,'')),
+                      placeholder: "e.g. 1997",
+                      inputMode: "numeric"
+                    })
+                  ),
+                  React.createElement("label", null,
+                    React.createElement("span", {className:"labelText small"}, "Year to"),
+                    React.createElement("input", {
+                      className:"input",
+                      value: yearTo,
+                      onChange: (e)=> setYearTo(e.target.value.replace(/[^0-9]/g,'')),
+                      placeholder: "e.g. 2007",
+                      inputMode: "numeric"
+                    })
+                  )
+                ),
+                React.createElement("label", {className:"sortControl"},
+                  React.createElement("span", {className:"labelText small"}, "Sort"),
+                  React.createElement("select", {className:"select", value: sort, onChange: (e)=> setSort(e.target.value)},
+                    React.createElement("option", {value:"relevance"}, "Relevance"),
+                    React.createElement("option", {value:"year-asc"}, "Year ↑"),
+                    React.createElement("option", {value:"year-desc"}, "Year ↓")
+                  )
+                )
+              )
+            ),
+
+            React.createElement("section", {className:"metaRow"},
+              React.createElement("div", null,
+                React.createElement("strong", null, numFound.toLocaleString()), " results",
+                React.createElement("span", {className:"dot"}), "page ",
+                React.createElement("strong", null, page), " / ", React.createElement("strong", null, totalPages)
+              ),
+              React.createElement("div", {className:"pagination"},
+                React.createElement("button", {
+                  className:"btn",
+                  onClick: prevPage,
+                  disabled: page <= 1 || loading,
+                  "aria-disabled": page <= 1 || loading
+                }, "Prev"),
+                React.createElement("button", {
+                  className:"btn",
+                  onClick: nextPage,
+                  disabled: page >= totalPages || loading,
+                  "aria-disabled": page >= totalPages || loading
+                }, "Next")
+              )
+            ),
+
+            React.createElement("section", {className:"results"},
+              loading && React.createElement("div", {className:"state info"}, "Loading results…"),
+              error && React.createElement("div", {className:"state error"}, error),
+              (!loading && !error && results.length === 0 && debouncedTitle.trim()) && React.createElement("div", {className:"state empty"}, "No results found. Try broadening filters or checking spelling."),
+
+              React.createElement("div", {className:"grid"},
+                results.map((doc, idx) => {
+                  const cover = doc.cover_i ? COVER_BASE(doc.cover_i) : PLACEHOLDER;
+                  const authors = formatAuthors(doc.author_name);
+                  const subjects = Array.isArray(doc.subject) ? doc.subject.slice(0,5) : [];
+                  const year = doc.first_publish_year || "—";
+                  const editions = doc.edition_count || 0;
+                  return React.createElement("article", {key: doc.key + "-" + idx, className:"card"},
+                    React.createElement("img", {
+                      src: cover,
+                      alt: doc.title ? `Cover of ${doc.title}` : "Book cover",
+                      className:"cover",
+                      loading:"lazy",
+                      width:92,
+                      height:132,
+                      onError: (e)=> { e.currentTarget.src = PLACEHOLDER; }
+                    }),
+                    React.createElement("div", {className:"cardBody"},
+                      React.createElement("h3", {className:"cardTitle"}, doc.title),
+                      React.createElement("p", {className:"muted"}, authors),
+                      React.createElement("p", {className:"metaSmall"}, "First published: ", React.createElement("strong", null, year), " • ", editions, " editions"),
+                      React.createElement("div", {className:"chips"},
+                        subjects.map((s,i)=> React.createElement("span", {key:i, className:"chip"}, s))
+                      ),
+                      React.createElement("div", {className:"cardActions"},
+                        React.createElement("button", {
+                          className:"btn small",
+                          onClick: ()=> openDetails(doc)
+                        }, "Details"),
+                        React.createElement("a", {
+                          className:"btn small link",
+                          href: `https://openlibrary.org${doc.key}`,
+                          target:"_blank",
+                          rel:"noopener noreferrer"
+                        }, "Open")
+                      )
+                    )
+                  );
+                })
+              )
+            )
+          ),
+
+          selectedWork && React.createElement("div", {className:"modalBackdrop", onClick: closeDetails, onKeyDown: onKeyDownModal, tabIndex: -1},
+            React.createElement("div", {className:"modal", role:"dialog", "aria-modal":"true", onClick: (e)=> e.stopPropagation(), ref: modalRef, tabIndex: -1},
+              React.createElement("div", {className:"modalHeader"},
+                React.createElement("h2", {className:"modalTitle"}, selectedWork.title || "Details"),
+                React.createElement("button", {className:"btn icon", onClick: closeDetails, "aria-label":"Close details"}, "Close")
+              ),
+              detailsLoading && React.createElement("div", {className:"state info"}, "Loading details…"),
+              detailsError && React.createElement("div", {className:"state error"}, detailsError),
+              details && React.createElement("div", {className:"modalBody"},
+                React.createElement("p", null,
+                  (() => {
+                    const d = details.description;
+                    if (!d) return "No description available.";
+                    if (typeof d === "string") return d;
+                    if (typeof d === "object" && d.value) return d.value;
+                    return "No description available.";
+                  })()
+                ),
+                details.subjects && details.subjects.length > 0 && React.createElement("div", {className:"modalSubjects"},
+                  details.subjects.slice(0,12).map((s,i)=> React.createElement("span", {key:i, className:"chip"}, s))
+                ),
+                React.createElement("p", {className:"muted small"}, "Work key: ", selectedWork.key)
+              )
+            )
+          )
+        )
+      );
+    }
+
+    const root = createRoot(document.getElementById("root"));
+    root.render(React.createElement(App));
+  </script>
+</body>
+</html>
